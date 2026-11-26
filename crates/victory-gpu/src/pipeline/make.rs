@@ -80,16 +80,82 @@ impl Pending {
         // crashed under stays inside the call for good (see [`guard_start`]),
         // and anyone else asking would wait for it forever.
         if self.made.get().is_none() {
-            let made = if is_bad_key(&self.key) {
+            static BAD_SHADERS: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+            let bad = BAD_SHADERS.get_or_init(|| {
+                let mut set = std::collections::HashSet::new();
+                if let Ok(env) = std::env::var("VICTORY_SKIP_PIPELINES") {
+                    for h in env.split(',') {
+                        let h = h.trim().to_ascii_lowercase();
+                        if !h.is_empty() {
+                            set.insert(h);
+                        }
+                    }
+                }
+                if let Some(path) = super::library::bad_shaders_path()
+                    && let Ok(contents) = std::fs::read_to_string(path)
+                {
+                    for line in contents.lines() {
+                        let h = line.trim().to_ascii_lowercase();
+                        if !h.is_empty() {
+                            set.insert(h);
+                        }
+                    }
+                }
+                set
+            });
+
+            let made = if is_bad_key(&self.key)
+                || self.shaders.iter().any(|s| bad.contains(&s.hash.to_ascii_lowercase()))
+            {
                 SKIPPED_BAD.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(key = self.key, shaders = ?self.shaders, "not made: the driver's compiler crashed on it before");
+                tracing::warn!(key = self.key, shaders = ?self.shaders, "not made: the driver's compiler crashed on it before (bad_shaders.txt / warm-bad.txt / VICTORY_SKIP_PIPELINES)");
                 None
             } else {
                 let _building = crate::timeline::span("pipeline: build a host pipeline");
                 let began = Instant::now();
-                let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
-                super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
-                made
+
+                unsafe extern "C" {
+                    fn victory_seh_call(
+                        func: unsafe extern "C" fn(*mut std::ffi::c_void),
+                        ctx: *mut std::ffi::c_void,
+                    ) -> i32;
+                }
+                struct CallCtx<'a> {
+                    shaders: &'a [Arc<Shader>],
+                    graphics: Option<&'a GraphicsState>,
+                    out: Option<HostPipeline>,
+                }
+                unsafe extern "C" fn run_make(raw: *mut std::ffi::c_void) {
+                    let ctx = unsafe { &mut *raw.cast::<CallCtx<'_>>() };
+                    ctx.out = HostPipeline::new(ctx.shaders, ctx.graphics);
+                }
+                let mut ctx = CallCtx {
+                    shaders: &self.shaders,
+                    graphics: self.graphics.as_deref(),
+                    out: None,
+                };
+                let ok = unsafe { victory_seh_call(run_make, (&raw mut ctx).cast()) };
+                if ok == 0 {
+                    tracing::warn!(
+                        shaders = ?self.shaders,
+                        "host driver raised 0xc0000005 compiling pipeline; skipping and recording in bad_shaders.txt"
+                    );
+                    if let Some(path) = super::library::bad_shaders_path()
+                        && let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(path)
+                    {
+                        use std::io::Write;
+                        for s in &self.shaders {
+                            let _ = writeln!(f, "{}", s.hash);
+                        }
+                    }
+                    None
+                } else {
+                    super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
+                    ctx.out
+                }
             };
             let _ = self.made.set(made);
         }
@@ -647,6 +713,7 @@ fn workers() -> bool {
         let mut running = false;
         let workers = worker_count(
             std::env::var("VICTORY_PIPELINE_WORKERS")
+                .or_else(|_| std::env::var("VICTORY_PIPELINE_THREADS"))
                 .ok()
                 .and_then(|v| v.trim().parse().ok()),
             std::thread::available_parallelism().map_or(2, |n| n.get()),
